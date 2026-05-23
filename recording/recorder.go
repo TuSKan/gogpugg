@@ -41,6 +41,7 @@ type Recorder struct {
 	dashPattern []float64
 	dashOffset  float64
 	fillRule    FillRule
+	antiAlias   bool
 	transform   Matrix
 
 	// Current font
@@ -63,6 +64,7 @@ type recorderState struct {
 	dashPattern []float64
 	dashOffset  float64
 	fillRule    FillRule
+	antiAlias   bool
 	transform   Matrix
 	fontFace    text.Face
 	fontFamily  string
@@ -87,6 +89,7 @@ func NewRecorder(width, height int) *Recorder {
 		lineJoin:    LineJoinMiter,
 		miterLimit:  4.0,
 		fillRule:    FillRuleNonZero,
+		antiAlias:   true,
 		transform:   Identity(),
 		stateStack:  make([]recorderState, 0, 8),
 	}
@@ -175,6 +178,12 @@ func (r *Recording) Playback(backend Backend) error {
 			brush := r.resources.GetBrush(c.Brush)
 			// Font face lookup would need additional handling
 			backend.DrawText(c.Text, c.X, c.Y, nil, brush)
+		case StrokeTextCommand:
+			brush := r.resources.GetBrush(c.Brush)
+			// StrokeText is recorded as a stroke text command.
+			// Backends that support text stroking can use the stroke style;
+			// others fall back to DrawText (fill) as an approximation.
+			backend.DrawText(c.Text, c.X, c.Y, nil, brush)
 		// Style commands are handled by the backend's internal state
 		// during the actual drawing operations
 		case SetFillStyleCommand, SetStrokeStyleCommand,
@@ -226,6 +235,7 @@ func (r *Recorder) Save() {
 		dashPattern: dashCopy,
 		dashOffset:  r.dashOffset,
 		fillRule:    r.fillRule,
+		antiAlias:   r.antiAlias,
 		transform:   r.transform,
 		fontFace:    r.fontFace,
 		fontFamily:  r.fontFamily,
@@ -254,6 +264,7 @@ func (r *Recorder) Restore() {
 	r.dashPattern = state.dashPattern
 	r.dashOffset = state.dashOffset
 	r.fillRule = state.fillRule
+	r.antiAlias = state.antiAlias
 	r.transform = state.transform
 	r.fontFace = state.fontFace
 	r.fontFamily = state.fontFamily
@@ -494,6 +505,18 @@ func (r *Recorder) SetFillRule(rule FillRule) {
 func (r *Recorder) SetFillRuleGG(rule gg.FillRule) {
 	// #nosec G115 -- FillRule enum values are within uint8 range
 	r.SetFillRule(FillRule(rule))
+}
+
+// SetAntiAlias enables or disables anti-aliasing for geometry rendering.
+// When disabled, shapes are rendered with binary coverage (no gray edge pixels).
+func (r *Recorder) SetAntiAlias(enabled bool) {
+	r.antiAlias = enabled
+	r.commands = append(r.commands, SetAntiAliasCommand{Enabled: enabled})
+}
+
+// AntiAlias returns whether anti-aliasing is enabled.
+func (r *Recorder) AntiAlias() bool {
+	return r.antiAlias
 }
 
 // --------------------------------------------------------------------------
@@ -1001,6 +1024,41 @@ func (r *Recorder) DrawStringAnchored(s string, x, y, ax, ay float64) {
 	// For recording, we store the base position and let the backend handle anchoring
 	// This is a simplification; a full implementation would measure text
 	r.DrawString(s, x, y)
+}
+
+// StrokeString strokes text outlines at position (x, y) where y is the baseline.
+// The stroke width, cap, join, and dash are captured from the current recorder state.
+func (r *Recorder) StrokeString(s string, x, y float64) {
+	px, py := r.transform.TransformPoint(x, y)
+
+	brushRef := r.resources.AddBrush(r.strokeBrush)
+
+	stroke := Stroke{
+		Width:       r.lineWidth,
+		Cap:         r.lineCap,
+		Join:        r.lineJoin,
+		MiterLimit:  r.miterLimit,
+		DashPattern: r.dashPattern,
+		DashOffset:  r.dashOffset,
+	}
+
+	r.commands = append(r.commands, StrokeTextCommand{
+		Text:       s,
+		X:          px,
+		Y:          py,
+		FontSize:   r.fontSize,
+		FontFamily: r.fontFamily,
+		Brush:      brushRef,
+		Stroke:     stroke,
+	})
+}
+
+// StrokeStringAnchored strokes text outlines with an anchor point.
+// The anchor point is specified by ax and ay, which are in the range [0, 1].
+func (r *Recorder) StrokeStringAnchored(s string, x, y, ax, ay float64) {
+	// For recording, we store the base position and let the backend handle anchoring
+	// This is a simplification; a full implementation would measure text
+	r.StrokeString(s, x, y)
 }
 
 // MeasureString returns approximate dimensions of text.

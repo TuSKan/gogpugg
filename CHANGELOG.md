@@ -5,6 +5,226 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.3] - 2026-05-22
+
+### Fixed
+
+- **SDF pipeline: transparent fill makes stroke invisible** (BUG-SDF-001) — `QueueShape`
+  now skips zero-alpha shapes. Premultiplied SrcOver blend with (0,0,0,0) is a mathematical
+  no-op but interfered with MSAA sample coverage weighting, causing subsequent strokes on
+  the same shape to render invisibly. Matches Skia `SkPaint::nothingToDraw()` (alpha==0 +
+  SrcOver → skip) and Cairo `nothing_to_do()` patterns.
+
+## [0.48.2] - 2026-05-22
+
+### Fixed
+
+- **Stroke expander: match Rust kurbo output** (#347) — root cause fix for stroke
+  rendering. Inner join handler emitted extra `lineTo(pivot+afterNorm)` and skip-threshold
+  path emitted connecting segments that Rust kurbo does not. Result: 397 elements (Go) vs
+  201 (Rust kurbo) with 196 duplicate points creating self-intersecting outlines. Fixed to
+  produce identical 201-element output matching Rust kurbo golden reference.
+
+- **Stroke fills routed through AnalyticFiller** — architectural routing matching Skia Ganesh
+  pattern (strokes → scanline renderer, not tile rasterizer). Multi-contour closed-path
+  strokes (e.g., glyph "O" → 4 contours) require per-scanline winding tracking.
+
+### Added
+
+- Golden test `TestStrokeExpander_SineWaveGolden` — verifies 201 elements, 0 duplicate
+  points, 0 self-intersections, key coordinates match Rust kurbo.
+
+## [0.48.1] - 2026-05-22
+
+### Fixed
+
+- **GPU stroke renders polyline as filled polygon** (#347, @TuSKan) — three-part fix
+  for GPU-accelerated stroke rendering of multi-segment polylines (ADR-037):
+
+  1. **CPU stroke filler selection** — stroke-expanded fills now force AnalyticFiller
+     (scanline AA), bypassing SparseStripsFiller which has a winding propagation bug
+     for self-intersecting stroke outlines (BUG-SPARSE-STRIPS-001). This is the primary
+     fix for pixmap contexts where GPU fallback to CPU produces thick aliased strokes.
+
+  2. **GPU lazy initialization** — `FillPath`/`StrokePath` now call `ensureGPU()` for
+     lazy device creation, matching the pattern used by text methods (`DrawText`).
+     Previously GPU path always failed for pixmap contexts (`gpuReady=false`).
+
+  3. **Convex fast-path FillRule gate** — convex polygon renderer now skipped for
+     `FillRuleEvenOdd` paths. Stroke-expanded outlines can pass `IsConvex()` check
+     despite self-intersecting; convex renderer ignores FillRule, filling the convex
+     hull. Added Skia-style direction-flip check (`IsConcaveBySign` pattern) to
+     `IsConvex()` for additional protection.
+
+### Changed
+
+- `IsConvex()` now checks direction-flip count per axis (max 3, matching Skia
+  `IsConcaveBySign` and femtovg). Rejects self-intersecting stroke outlines that
+  previously passed the cross-product-sign-only check.
+
+### Dependencies
+
+- gogpu v0.39.0, wgpu v0.28.7, gpucontext v0.19.0
+
+## [0.48.0] - 2026-05-21
+
+### Added
+
+- **Text stroke/outline API** (ADR-033, #334, @rcarlier) — enterprise text stroke matching
+  Skia `kStroke_Style`, Cairo `cairo_text_path`, HTML5 `strokeText`, Vello `DrawGlyphs+Stroke`:
+  - `StrokeString(s, x, y)` — strokes glyph outlines using current line width/cap/join
+  - `StrokeStringAnchored(s, x, y, ax, ay)` — anchored variant
+  - `TextPath(s, x, y) *Path` — returns glyph outlines as Path for fill/stroke/clip
+  - Always uses vector outlines regardless of TextMode (MSDF/GlyphMask can't be stroked)
+  - Recording mirror: `StrokeTextCommand`
+
+  ```go
+  dc.SetLineWidth(3)
+  dc.SetRGB(0, 0, 0)
+  dc.StrokeString("Hello", x, y)  // black outline
+  dc.SetRGB(1, 1, 1)
+  dc.DrawString("Hello", x, y)    // white fill on top
+  ```
+
+- **Aliased text mode** (ADR-034, #334, @rcarlier) — pixel-perfect text rendering with binary
+  coverage (0 or 255, no gray pixels). Matches Skia `SkFont::Edging::kAlias`:
+  - `dc.SetTextMode(gg.TextModeAliased)` — new TextMode value
+  - GlyphMask (Tier 6): `NoAAFiller` for binary glyph masks
+  - MSDF (Tier 4): `step(0.5)` shader for hard edges
+  - Separate from geometry AA (`SetAntiAlias`) — matches Skia/Cairo separation
+
+  ```go
+  dc.SetTextMode(gg.TextModeAliased)
+  dc.DrawString("Pixel Perfect", x, y)  // no gray edge pixels
+  ```
+
+### Fixed
+
+- **Text invisible on clipped sibling elements** (#335, #338, #339, #340, @celer) — batch
+  coalescing (ADR-031) merged same-style text across scissor boundaries. Per-tier seal
+  flags (`textBatchSealed`, `glyphBatchSealed`) now prevent merging across clip changes.
+  Both Tier 4 (MSDF) and Tier 6 (GlyphMask) covered. Intra-group merging preserved.
+
+- **NaN/Inf stack overflow in curve subdivision** (ADR-035, #341, @rcarlier) — 12 recursive
+  curve flattening functions across 4 files now have `depth > 10` guards (16 for arc length).
+  Prevents stack overflow on NaN/Inf coordinates. 18 NaN/Inf safety tests.
+
+- **DrawRegularPolygon rotation** (#334, @rcarlier) — fogleman/gg compatibility: odd-sided
+  polygons (triangle, pentagon) vertex pointing up at rotation=0, even-sided (square,
+  hexagon) flat top. 5 vertex positioning tests.
+
+### Performance
+
+- **Zero-alloc stroke path** — `strokeResultToPath` reuses scratch `Path` on
+  `SoftwareRenderer` (Skia `fOuter.reset()` pattern). StrokePath: 1 → 0 allocs, 4.3× faster.
+
+- **Zero-alloc paint color** (ADR-036) — `SetRGB`/`SetRGBA`/`SetHexColor` now write
+  directly to inline `solidColor RGBA` value field on Paint, bypassing interface boxing
+  and `*SolidPattern` heap allocation (Skia `fColor4f` dual-field pattern).
+  SetRGB: 2 → 0 allocs. ComplexScene: 80 → 68 allocs (-15%).
+
+### Changed
+
+- **Dependencies** — wgpu v0.28.6 (GLES hidden window context), gogpu v0.38.0
+  (PlatformProvider delegation, SurfaceState lifecycle).
+
+## [0.47.4] - 2026-05-21
+
+### Added
+
+- **`NewPixmapFromBuffer(buf, width, height)`** (#336, @huanfeng) — wrap a caller-owned
+  premultiplied-RGBA buffer as a Pixmap without allocating. Enables zero-copy buffer reuse
+  in hot rendering loops (e.g., software IME at 60fps). Integer overflow guard protects
+  32-bit platforms. Follows Skia `SkPixmap` / Go `image.RGBA.SubImage` aliasing pattern.
+
+- **`(*Pixmap).ImageView()`** (#336, @huanfeng) — zero-copy alternative to `ToImage()`.
+  Returns `*image.RGBA` whose `Pix` aliases the pixmap's buffer. O(1) with no data copy.
+
+## [0.47.3] - 2026-05-19
+
+### Fixed
+
+- **HiDPI quarter-screen rendering** (#327, #332, @unxed) — `trackDamage()` recorded
+  damage rects in logical coordinates, but OS compositor APIs (Vulkan
+  `VK_KHR_incremental_present`, DX12 `Present1`, EGL) expect physical pixels.
+  Compositor updated only the logical area (800×600) instead of the full physical
+  surface (1600×1200). Fix: scale damage rects by `deviceScale` with Floor/Ceil
+  conservative rounding. Guard uses `deviceMatrix.IsIdentity()` (enterprise pattern).
+
+- **`SetPresentDamage()` coordinate mismatch** (BUG-GG-DAMAGE-COORDS-001) — documentation
+  said "physical pixels" but callers (ui widget tree) passed logical coordinates.
+  Fix: scale logical→physical inside `SetPresentDamage()`, corrected documentation.
+
+### Added
+
+- **9 damage scaling regression tests** — HiDPI scale 2.0/3.0/1.5, partial rect,
+  fractional coords, stroke, multiple rects, public API (`TrackDamageRect`).
+
+## [0.47.2] - 2026-05-16
+
+### Fixed
+
+- **ggcanvas.Draw() per-frame state reset** (#328, @unxed) — `Draw()` now wraps
+  the user closure with `Push()/Identity()/ClearPath()/Pop()` (Skia SkAutoCanvasRestore
+  pattern, ADR-032). Matrix transforms, paths, and clips no longer accumulate across
+  frames. Configuration state (font, paint color, textMode) persists as expected.
+
+### Added
+
+- **Draw state reset tests** — 5 tests: matrix reset, path clear, font persistence,
+  Push unwind, multi-frame stability (10 frames with drift detection).
+
+## [0.47.1] - 2026-05-16
+
+### Fixed
+
+- **Text rendering performance: batch coalescing** (#322, @unxed) — consecutive
+  `DrawString` calls with the same transform/color/atlas page now merge into a single
+  GPU draw call. Previously each call produced a separate batch → 2400 individual
+  `DrawString("A")` calls generated 2400 GPU draw calls (~55ms on Intel HD 520).
+  With coalescing: 1 draw call (~2ms). Architecture: ADR-031, enterprise pattern
+  (Skia `SkTextBlob` → `DirectMaskSubRun`, Chrome text blob batching).
+
+  Applies to both Tier 6 (GlyphMask) and Tier 4 (MSDF) text pipelines.
+
+### Added
+
+- **HiDPI dimension warning in ggcanvas.New()** (#322) — warns when passed dimensions
+  appear to be physical pixels instead of logical, catching the common mistake of using
+  `FramebufferWidth/Height` instead of `Width/Height` on HiDPI displays.
+
+- **Batch coalescing tests** — 15 tests for `CanMerge` + coalescing behavior
+  (same-style merge, different-color/transform/LCD/atlas no-merge, mixed sequences).
+  6 tests for HiDPI dimension warning detection.
+
+## [0.47.0] - 2026-05-16
+
+### Added
+
+- **Pixel-Perfect Mode (Anti-Aliasing Toggle)** — `dc.SetAntiAlias(false)` disables
+  anti-aliasing for geometry rendering, producing crisp aliased edges with binary
+  coverage (fully inside or fully outside). Use cases: pixel art, retro-style graphics,
+  L-System fractals, technical drawings, sharp grid lines. (#319, @rcarlier)
+
+  - **API:** `Context.SetAntiAlias(enabled bool)` / `Context.AntiAlias() bool`.
+    Context-level state, participates in Push/Pop. Text AA remains independent (TextMode).
+  - **CPU:** Dedicated `NoAAFiller` — integer scanline walker with `FixedRoundToInt`
+    edge rounding. Completely separate code path (Skia `SkScan::FillPath` / tiny-skia
+    `scan::path` pattern), ~2-3× faster than analytic AA.
+  - **GPU SDF:** Binary step coverage via `anti_alias` uniform flag. Shapes render
+    with hard pixel edges on all backends (Vulkan, DX12, Metal, GLES, Software).
+  - **Recording:** `Recorder.SetAntiAlias()` mirrors the Context API for vector export.
+  - **Architecture:** ADR-030, based on research of 5 enterprise engines (Skia, Cairo,
+    tiny-skia, Vello, femtovg). All use separate non-AA code paths, not threshold on
+    AA output.
+
+  ```go
+  dc.SetAntiAlias(false)  // all subsequent draws — pixel-perfect
+  dc.DrawRectangle(10, 10, 100, 50)
+  dc.Fill()               // binary fill, no gray edge pixels
+  dc.SetAntiAlias(true)   // back to smooth AA
+  ```
+
 ## [0.46.11] - 2026-05-14
 
 ### Fixed

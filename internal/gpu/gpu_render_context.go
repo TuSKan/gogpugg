@@ -48,6 +48,13 @@ type GPURenderContext struct {
 	clipPath        *gg.Path // arbitrary clip path for depth clipping (GPU-CLIP-003a)
 	scissorSegments []scissorSegment
 
+	// Per-tier batch seal flags prevent merging across scissor boundaries.
+	// Two separate flags needed: a single shared flag would be consumed by
+	// the first Queue call (e.g., QueueText), allowing the second tier
+	// (e.g., QueueGlyphMask) to merge across the same boundary.
+	textBatchSealed  bool // seals QueueText (MSDF Tier 4)
+	glyphBatchSealed bool // seals QueueGlyphMask (Tier 6)
+
 	// Per-context frame tracking (fixes LoadOp corruption).
 	// When frameRendered is true, subsequent render passes use LoadOpLoad.
 	// Reset by BeginFrame() at the start of each frame.
@@ -57,6 +64,9 @@ type GPURenderContext struct {
 	// Per-context scene stats (for Auto pipeline mode).
 	sceneStats   gg.SceneStats
 	pipelineMode gg.PipelineMode
+
+	// Anti-aliasing state for GPU rendering (propagated from Context).
+	antiAlias bool
 
 	// Shared command encoder for single-command-buffer frames (ADR-017).
 	// When set, Flush records render passes into this encoder instead of
@@ -78,6 +88,12 @@ func (rc *GPURenderContext) PendingCount() int {
 // SetPipelineMode sets the pipeline mode for this context's operations.
 func (rc *GPURenderContext) SetPipelineMode(mode gg.PipelineMode) {
 	rc.pipelineMode = mode
+}
+
+// SetAntiAlias sets the anti-aliasing state for GPU rendering.
+// When false, SDF shapes use binary step coverage instead of smoothstep.
+func (rc *GPURenderContext) SetAntiAlias(enabled bool) {
+	rc.antiAlias = enabled
 }
 
 // SetClipRect records a scissor rect change for this context.
@@ -134,6 +150,8 @@ func (rc *GPURenderContext) BeginFrame() {
 	rc.clipPath = nil
 	rc.frameRendered = false
 	rc.lastView = nil
+	rc.textBatchSealed = false
+	rc.glyphBatchSealed = false
 }
 
 // SetSharedEncoder sets a shared command encoder for single-command-buffer
@@ -204,6 +222,16 @@ func (rc *GPURenderContext) QueueShape(target gg.GPURenderTarget, shape gg.Detec
 	if !ok {
 		return gg.ErrFallbackToCPU
 	}
+
+	// Skip zero-alpha shapes — premultiplied SrcOver with (0,0,0,0) is a
+	// mathematical no-op but wastes GPU bandwidth and can interfere with
+	// MSAA sample coverage weighting (BUG-SDF-001: transparent fill makes
+	// subsequent stroke invisible). Enterprise pattern: Skia nothingToDraw()
+	// (SkPaint.cpp:273), Cairo nothing_to_do() (cairo-surface.c:2148).
+	if rs.ColorA == 0 {
+		return nil
+	}
+
 	rc.pendingShapes = append(rc.pendingShapes, rs)
 
 	rc.pendingTarget = target
@@ -236,12 +264,28 @@ func (rc *GPURenderContext) QueueStencil(target gg.GPURenderTarget, cmd StencilP
 }
 
 // QueueText accumulates an MSDF text batch for dispatch.
+// Adjacent batches with identical visual properties (transform, color, atlas,
+// MSDF parameters) are coalesced into a single batch to minimize GPU draw calls (ADR-031).
 func (rc *GPURenderContext) QueueText(target gg.GPURenderTarget, batch TextBatch) {
 	if rc.hasPendingTarget && !sameTarget(&rc.pendingTarget, &target) {
 		if fErr := rc.Flush(rc.pendingTarget); fErr != nil {
 			slogger().Warn("auto-flush failed", "err", fErr)
 		}
 	}
+	// Coalesce with last pending batch if same visual properties (ADR-031).
+	// Skip merging if a scissor boundary was crossed since the last batch was
+	// queued (textBatchSealed=true); this keeps text batches within the
+	// correct scissor group so text is not clipped by a sibling element's rect.
+	if n := len(rc.pendingTextBatches); n > 0 && !rc.textBatchSealed {
+		last := &rc.pendingTextBatches[n-1]
+		if last.CanMerge(batch) {
+			last.Quads = append(last.Quads, batch.Quads...)
+			rc.pendingTarget = target
+			rc.hasPendingTarget = true
+			return
+		}
+	}
+	rc.textBatchSealed = false // new batch started; allow future merges within same scissor region
 	rc.pendingTextBatches = append(rc.pendingTextBatches, batch)
 	rc.pendingTarget = target
 	rc.hasPendingTarget = true
@@ -319,12 +363,28 @@ func (rc *GPURenderContext) QueueGPUTextureDraw(target gg.GPURenderTarget, view 
 }
 
 // QueueGlyphMask accumulates a glyph mask batch for dispatch.
+// Adjacent batches with identical visual properties (transform, color, LCD mode,
+// atlas page) are coalesced into a single batch to minimize GPU draw calls (ADR-031).
 func (rc *GPURenderContext) QueueGlyphMask(target gg.GPURenderTarget, batch GlyphMaskBatch) {
 	if rc.hasPendingTarget && !sameTarget(&rc.pendingTarget, &target) {
 		if fErr := rc.Flush(rc.pendingTarget); fErr != nil {
 			slogger().Warn("auto-flush failed", "err", fErr)
 		}
 	}
+	// Coalesce with last pending batch if same visual properties (ADR-031).
+	// Skip merging if a scissor boundary was crossed since the last batch was
+	// queued (glyphBatchSealed=true); this keeps glyph batches within the
+	// correct scissor group so text is not clipped by a sibling element's rect.
+	if n := len(rc.pendingGlyphMaskBatches); n > 0 && !rc.glyphBatchSealed {
+		last := &rc.pendingGlyphMaskBatches[n-1]
+		if last.CanMerge(batch) {
+			last.Quads = append(last.Quads, batch.Quads...)
+			rc.pendingTarget = target
+			rc.hasPendingTarget = true
+			return
+		}
+	}
+	rc.glyphBatchSealed = false
 	rc.pendingGlyphMaskBatches = append(rc.pendingGlyphMaskBatches, batch)
 	rc.pendingTarget = target
 	rc.hasPendingTarget = true
@@ -402,6 +462,44 @@ func (rc *GPURenderContext) DrawGlyphMaskText(target gg.GPURenderTarget, face an
 	return nil
 }
 
+// DrawGlyphMaskTextAliased shapes and queues text for aliased (binary coverage)
+// glyph mask rendering. Same pipeline as DrawGlyphMaskText but rasterizes with
+// NoAAFiller (0/255 only) instead of AnalyticFiller (256-level AA).
+func (rc *GPURenderContext) DrawGlyphMaskTextAliased(target gg.GPURenderTarget, face any, s string, x, y float64, color gg.RGBA, matrix gg.Matrix, deviceScale float64) error {
+	textFace, ok := face.(text.Face)
+	if !ok || textFace == nil {
+		return gg.ErrFallbackToCPU
+	}
+
+	rc.sceneStats.TextCount++
+
+	if !rc.shared.gpuReady {
+		rc.shared.mu.Lock()
+		err := rc.shared.ensureGPU()
+		rc.shared.mu.Unlock()
+		if err != nil || !rc.shared.gpuReady {
+			return gg.ErrFallbackToCPU
+		}
+	}
+
+	rc.shared.mu.Lock()
+	rc.shared.ensureGlyphMaskEngine()
+	engine := rc.shared.glyphMaskEngine
+	rc.shared.mu.Unlock()
+
+	batch, err := engine.LayoutTextAliased(textFace, s, x, y, color, matrix, deviceScale)
+	if err != nil {
+		slogger().Debug("DrawGlyphMaskTextAliased: LayoutTextAliased failed", "err", err, "text", s, "w", target.Width, "h", target.Height)
+		return gg.ErrFallbackToCPU
+	}
+	if len(batch.Quads) == 0 {
+		return nil
+	}
+
+	rc.QueueGlyphMask(target, batch)
+	return nil
+}
+
 // DrawShapedGlyphMaskText renders pre-shaped glyphs through the glyph mask pipeline.
 // Same as DrawGlyphMaskText but skips shaping — uses stored glyph positions directly.
 func (rc *GPURenderContext) DrawShapedGlyphMaskText(target gg.GPURenderTarget, face any, glyphs []text.ShapedGlyph, x, y float64, color gg.RGBA, matrix gg.Matrix, deviceScale float64) error {
@@ -442,7 +540,12 @@ func (rc *GPURenderContext) DrawShapedGlyphMaskText(target gg.GPURenderTarget, f
 // FillPath queues a filled path for GPU rendering.
 func (rc *GPURenderContext) FillPath(target gg.GPURenderTarget, path *gg.Path, paint *gg.Paint) error {
 	if !rc.shared.gpuReady {
-		return gg.ErrFallbackToCPU
+		rc.shared.mu.Lock()
+		err := rc.shared.ensureGPU()
+		rc.shared.mu.Unlock()
+		if err != nil || !rc.shared.gpuReady {
+			return gg.ErrFallbackToCPU
+		}
 	}
 
 	rc.sceneStats.PathCount++
@@ -454,6 +557,7 @@ func (rc *GPURenderContext) FillPath(target gg.GPURenderTarget, path *gg.Path, p
 		va := rc.shared.velloAccel
 		rc.shared.mu.Unlock()
 		if va != nil && va.CanCompute() {
+			va.SetAntiAlias(rc.antiAlias)
 			return va.FillPath(target, path, paint)
 		}
 	}
@@ -471,14 +575,22 @@ func (rc *GPURenderContext) FillPath(target gg.GPURenderTarget, path *gg.Path, p
 	premulB := float32(color.B * color.A)
 	premulA := float32(color.A)
 
-	// Try convex fast-path.
-	if points, ok := extractConvexPolygon(path); ok {
-		cmd := ConvexDrawCommand{
-			Points: points,
-			Color:  [4]float32{premulR, premulG, premulB, premulA},
+	// Try convex fast-path (NonZero fill rule only).
+	// The convex renderer uses centroid fan tessellation without stencil buffer,
+	// which is structurally equivalent to NonZero fill. For EvenOdd paths
+	// (e.g., stroke-expanded ring outlines), the stencil-then-cover path below
+	// must be used — it correctly implements EvenOdd via stencil bit inversion.
+	// Skia Ganesh gates its convex fast-path on isSimpleFill() for the same reason.
+	if paint.FillRule != gg.FillRuleEvenOdd {
+		if points, ok := extractConvexPolygon(path); ok {
+			slogger().Debug("FillPath: convex fast-path", "points", len(points), "fillRule", paint.FillRule)
+			cmd := ConvexDrawCommand{
+				Points: points,
+				Color:  [4]float32{premulR, premulG, premulB, premulA},
+			}
+			rc.QueueConvex(target, cmd)
+			return nil
 		}
-		rc.QueueConvex(target, cmd)
-		return nil
 	}
 
 	// Fall back to stencil-then-cover.
@@ -515,6 +627,7 @@ func (rc *GPURenderContext) StrokePath(target gg.GPURenderTarget, path *gg.Path,
 		va := rc.shared.velloAccel
 		rc.shared.mu.Unlock()
 		if va != nil && va.CanCompute() {
+			va.SetAntiAlias(rc.antiAlias)
 			return va.StrokePath(target, path, paint)
 		}
 	}
@@ -538,13 +651,19 @@ func (rc *GPURenderContext) StrokePath(target gg.GPURenderTarget, path *gg.Path,
 
 	fillPath := strokeResultToPath(outVerbs, outCoords)
 
-	// Stroke-expanded outlines are ring-shaped contours (outer + inner edges).
-	// With NonZero fill rule, the fan tessellator fills the entire interior
-	// including the hollow center — rendering as a lens/chord shape.
-	// EvenOdd fill rule correctly handles ring topology: interior crosses
-	// 2 boundaries (even = empty), stroke band crosses 1 (odd = filled).
-	// This is the Skia Ganesh pattern for GPU stroke rendering.
-	// Fixes ui#101 Thread F (circular progress arc rendered as filled lens).
+	// Stroke-expanded outlines require EvenOdd fill rule for BOTH open and
+	// closed paths. The stroke expander's inner join pivot routing (handleInnerJoin)
+	// creates self-intersecting V-shapes at each vertex. With NonZero fill,
+	// stencil fan tessellation counts winding=2 at pixels between forward/reverse
+	// edges, incorrectly filling the entire interior. With EvenOdd, self-intersection
+	// crossings XOR correctly: stroke band (1 crossing = odd = filled), interior
+	// area (2 crossings = even = empty).
+	//
+	// This applies to both topologies:
+	//   - Closed paths: ring topology (2 contours, hollow center)
+	//   - Open paths: self-intersecting single contour (inner join V-shapes)
+	//
+	// Skia Ganesh pattern. Fixes ui#101 Thread F + issue #347.
 	strokePaint := *paint
 	strokePaint.FillRule = gg.FillRuleEvenOdd
 	return rc.FillPath(target, fillPath, &strokePaint)
@@ -564,6 +683,7 @@ func (rc *GPURenderContext) FillShape(target gg.GPURenderTarget, shape gg.Detect
 		va := rc.shared.velloAccel
 		rc.shared.mu.Unlock()
 		if va != nil && va.CanCompute() {
+			va.SetAntiAlias(rc.antiAlias)
 			return va.FillShape(target, shape, paint)
 		}
 	}
@@ -584,6 +704,7 @@ func (rc *GPURenderContext) StrokeShape(target gg.GPURenderTarget, shape gg.Dete
 		va := rc.shared.velloAccel
 		rc.shared.mu.Unlock()
 		if va != nil && va.CanCompute() {
+			va.SetAntiAlias(rc.antiAlias)
 			return va.StrokeShape(target, shape, paint)
 		}
 	}
@@ -625,6 +746,9 @@ func (rc *GPURenderContext) Flush(target gg.GPURenderTarget) error { //nolint:cy
 		rc.session.SetConvexRenderer(convexRend)
 		rc.session.SetStencilRenderer(stencilRend)
 	}
+
+	// Propagate per-frame anti-aliasing state to session.
+	rc.session.antiAlias = rc.antiAlias
 
 	// Transfer per-context frame tracking to session before rendering.
 	rc.session.SetFrameState(rc.frameRendered, rc.lastView)
@@ -852,11 +976,17 @@ func (rc *GPURenderContext) Close() {
 	rc.clipRRect = nil
 	rc.clipPath = nil
 	rc.scissorSegments = nil
+	rc.textBatchSealed = false
+	rc.glyphBatchSealed = false
 	rc.sceneStats = gg.SceneStats{}
 }
 
 // recordScissorSegment records a scissor state change in the timeline.
+// It seals both text tiers so the next QueueGlyphMask/QueueText starts
+// a new batch instead of merging across the scissor boundary.
 func (rc *GPURenderContext) recordScissorSegment(rect *[4]uint32) {
+	rc.textBatchSealed = true
+	rc.glyphBatchSealed = true
 	seg := scissorSegment{
 		sdfCount:     len(rc.pendingShapes),
 		convexCount:  len(rc.pendingConvexCommands),

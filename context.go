@@ -64,6 +64,10 @@ type Context struct {
 	// Rasterizer mode
 	rasterizerMode RasterizerMode // CPU rasterizer selection mode
 
+	// Anti-aliasing
+	antiAlias      bool   // anti-aliasing enabled (default: true)
+	antiAliasStack []bool // Push/Pop stack for antiAlias state
+
 	// Text rendering
 	textMode         TextMode               // text strategy selection (default: Auto)
 	outlineExtractor *text.OutlineExtractor // lazy: for transform-aware text (Strategy B)
@@ -171,6 +175,7 @@ func NewContext(width, height int, opts ...ContextOption) *Context {
 		clipStackDepth:        make([]int, 0, 8),
 		pipelineMode:          options.pipelineMode,
 		damageTrackingEnabled: true,
+		antiAlias:             true,
 	}
 }
 
@@ -307,6 +312,29 @@ func (c *Context) SetRasterizerMode(mode RasterizerMode) {
 // RasterizerMode returns the current rasterizer mode.
 func (c *Context) RasterizerMode() RasterizerMode {
 	return c.rasterizerMode
+}
+
+// SetAntiAlias enables or disables anti-aliasing for geometry rendering.
+//
+// When enabled (default), shapes are rendered with smooth edges using analytic
+// anti-aliasing (Skia AAA). When disabled, shapes are rendered with binary
+// coverage (fully inside or fully outside) producing crisp, aliased edges.
+//
+// This is useful for pixel art, retro-style graphics, technical drawings,
+// and any use case where sub-pixel blending is undesirable.
+//
+// Text anti-aliasing is controlled independently via SetTextMode.
+// The anti-aliasing state participates in Push/Pop.
+//
+// Reference: Skia SkPaint::setAntiAlias, Cairo cairo_set_antialias,
+// tiny-skia Paint.anti_alias.
+func (c *Context) SetAntiAlias(enabled bool) {
+	c.antiAlias = enabled
+}
+
+// AntiAlias returns whether anti-aliasing is enabled for geometry rendering.
+func (c *Context) AntiAlias() bool {
+	return c.antiAlias
 }
 
 // SetTextMode sets the text rendering strategy.
@@ -493,6 +521,9 @@ func (c *Context) SetDamageTracking(enabled bool) {
 // Callers with retained-mode knowledge (e.g., ui widget tree) should call
 // this for each dirty boundary after compositing, so that FrameDamage()
 // accurately reflects which surface regions changed this frame.
+//
+// Bounds are in logical (user-space) coordinates. The context automatically
+// scales them to physical pixels via deviceScale for the OS compositor.
 func (c *Context) TrackDamageRect(bounds image.Rectangle) {
 	c.trackDamage(bounds)
 }
@@ -504,6 +535,20 @@ func (c *Context) trackDamage(bounds image.Rectangle) {
 	if !c.damageTrackingEnabled || bounds.Empty() {
 		return
 	}
+
+	// Scale logical damage rect to physical pixels for OS compositor APIs
+	// (Vulkan VK_KHR_incremental_present, DX12 Present1, EGL, Wayland damage_buffer).
+	// Floor/Ceil ensures conservative rounding with no pixel gaps.
+	if !c.deviceMatrix.IsIdentity() {
+		s := c.deviceScale
+		bounds = image.Rect(
+			int(math.Floor(float64(bounds.Min.X)*s)),
+			int(math.Floor(float64(bounds.Min.Y)*s)),
+			int(math.Ceil(float64(bounds.Max.X)*s)),
+			int(math.Ceil(float64(bounds.Max.Y)*s)),
+		)
+	}
+
 	c.frameDamageRects = append(c.frameDamageRects, bounds)
 	if len(c.frameDamageRects) > maxDamageRects {
 		merged := c.frameDamageRects[0]
@@ -546,22 +591,34 @@ func (c *Context) FillRectCPU(x, y, w, h float64, col RGBA) {
 
 // SetColor sets the current drawing color.
 func (c *Context) SetColor(col color.Color) {
-	c.paint.SetBrush(Solid(FromColor(col)))
+	c.paint.solidColor = FromColor(col)
+	c.paint.isSolid = true
+	c.paint.Brush = nil
+	c.paint.Pattern = nil
 }
 
 // SetRGB sets the current color using RGB values (0-1).
 func (c *Context) SetRGB(r, g, b float64) {
-	c.paint.SetBrush(SolidRGB(r, g, b))
+	c.paint.solidColor = RGBA{R: r, G: g, B: b, A: 1}
+	c.paint.isSolid = true
+	c.paint.Brush = nil
+	c.paint.Pattern = nil
 }
 
 // SetRGBA sets the current color using RGBA values (0-1).
 func (c *Context) SetRGBA(r, g, b, a float64) {
-	c.paint.SetBrush(SolidRGBA(r, g, b, a))
+	c.paint.solidColor = RGBA{R: r, G: g, B: b, A: a}
+	c.paint.isSolid = true
+	c.paint.Brush = nil
+	c.paint.Pattern = nil
 }
 
 // SetHexColor sets the current color using a hex string.
 func (c *Context) SetHexColor(hex string) {
-	c.paint.SetBrush(SolidHex(hex))
+	c.paint.solidColor = Hex(hex)
+	c.paint.isSolid = true
+	c.paint.Brush = nil
+	c.paint.Pattern = nil
 }
 
 // SetFillBrush sets the brush used for fill operations.
@@ -868,6 +925,9 @@ func (c *Context) Push() {
 		maskCopy = c.mask.Clone()
 	}
 	c.maskStack = append(c.maskStack, maskCopy)
+
+	// Save current anti-aliasing state
+	c.antiAliasStack = append(c.antiAliasStack, c.antiAlias)
 }
 
 // Pop restores the last saved state.
@@ -901,6 +961,12 @@ func (c *Context) Pop() {
 	if len(c.maskStack) > 0 {
 		c.mask = c.maskStack[len(c.maskStack)-1]
 		c.maskStack = c.maskStack[:len(c.maskStack)-1]
+	}
+
+	// Restore anti-aliasing state
+	if len(c.antiAliasStack) > 0 {
+		c.antiAlias = c.antiAliasStack[len(c.antiAliasStack)-1]
+		c.antiAliasStack = c.antiAliasStack[:len(c.antiAliasStack)-1]
 	}
 }
 
@@ -1134,9 +1200,17 @@ func (c *Context) DrawEllipticalArc(x, y, rx, ry, angle1, angle2 float64) {
 }
 
 // currentColor returns the current drawing color from the paint.
-// If the current pattern is a solid color, returns that color.
+// If the paint is a solid color, returns that color.
 // Otherwise returns black as a fallback.
 func (c *Context) currentColor() color.Color {
+	if c.paint.isSolid {
+		return c.paint.solidColor.Color()
+	}
+	if c.paint.Brush != nil {
+		if sb, ok := c.paint.Brush.(SolidBrush); ok {
+			return sb.Color.Color()
+		}
+	}
 	if p, ok := c.paint.Pattern.(*SolidPattern); ok {
 		return p.Color.Color()
 	}
@@ -1400,6 +1474,7 @@ type gpuContextOps interface {
 	StrokePath(target GPURenderTarget, path *Path, paint *Paint) error
 	DrawText(target GPURenderTarget, face any, s string, x, y float64, color RGBA, matrix Matrix, deviceScale float64) error
 	DrawGlyphMaskText(target GPURenderTarget, face any, s string, x, y float64, color RGBA, matrix Matrix, deviceScale float64) error
+	DrawGlyphMaskTextAliased(target GPURenderTarget, face any, s string, x, y float64, color RGBA, matrix Matrix, deviceScale float64) error
 	QueueImageDraw(target GPURenderTarget, pixelData []byte, genID uint64, imgWidth, imgHeight, imgStride int,
 		dstX, dstY, dstW, dstH, opacity float32, viewportW, viewportH uint32,
 		u0, v0, u1, v1 float32)
@@ -1416,6 +1491,7 @@ type gpuContextOps interface {
 	ClearClipPath()
 	BeginFrame()
 	SetPipelineMode(mode PipelineMode)
+	SetAntiAlias(enabled bool)
 	PendingCount() int
 	Close()
 }
@@ -1645,6 +1721,11 @@ func (c *Context) doFill() error {
 	// At scale=1.0 this is a zero-copy no-op.
 	devicePath := c.deviceSpacePath()
 
+	// Propagate anti-aliasing state to GPU render context.
+	if rc := c.gpuCtxOps(); rc != nil {
+		rc.SetAntiAlias(c.antiAlias)
+	}
+
 	// Temporarily swap c.path to device-space for GPU tryGPUOp
 	// (which reads c.path for shape detection and path rendering).
 	origPath := c.path
@@ -1655,11 +1736,15 @@ func (c *Context) doFill() error {
 		return nil
 	}
 
-	// CPU path: flush pending GPU, apply mode to software renderer.
+	// CPU path: flush pending GPU, apply mode and AA state to software renderer.
 	c.flushGPUAccelerator()
 	if sr, ok := c.renderer.(*SoftwareRenderer); ok {
 		sr.rasterizerMode = cpuMode
-		defer func() { sr.rasterizerMode = RasterizerAuto }()
+		sr.antiAlias = c.antiAlias
+		defer func() {
+			sr.rasterizerMode = RasterizerAuto
+			sr.antiAlias = true
+		}()
 	}
 
 	return c.renderer.Fill(c.pixmap, devicePath, c.paint)
@@ -1684,6 +1769,11 @@ func (c *Context) doStroke() error {
 	// Transform path to device-space for rendering.
 	devicePath := c.deviceSpacePath()
 
+	// Propagate anti-aliasing state to GPU render context.
+	if rc := c.gpuCtxOps(); rc != nil {
+		rc.SetAntiAlias(c.antiAlias)
+	}
+
 	// Temporarily swap c.path to device-space for GPU tryGPUOp.
 	origPath := c.path
 	c.path = devicePath
@@ -1692,11 +1782,14 @@ func (c *Context) doStroke() error {
 	if ok {
 		return nil
 	}
-
 	c.flushGPUAccelerator()
 	if sr, ok := c.renderer.(*SoftwareRenderer); ok {
 		sr.rasterizerMode = cpuMode
-		defer func() { sr.rasterizerMode = RasterizerAuto }()
+		sr.antiAlias = c.antiAlias
+		defer func() {
+			sr.rasterizerMode = RasterizerAuto
+			sr.antiAlias = true
+		}()
 	}
 
 	return c.renderer.Stroke(c.pixmap, devicePath, c.paint)

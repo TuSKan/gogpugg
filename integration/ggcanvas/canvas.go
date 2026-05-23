@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"math"
 
 	"github.com/gogpu/gg"
 	"github.com/gogpu/gpucontext"
@@ -84,8 +85,29 @@ func New(provider gpucontext.DeviceProvider, width, height int) (*Canvas, error)
 		if s := wp.ScaleFactor(); s > 0 {
 			scale = s
 		}
+		warnIfPhysicalDimensions(wp, width, height, scale)
 	}
 	return NewWithScale(provider, width, height, scale)
+}
+
+// warnIfPhysicalDimensions logs a warning when passed dimensions appear to be
+// physical pixels instead of logical points. Common mistake on HiDPI displays.
+func warnIfPhysicalDimensions(wp gpucontext.WindowProvider, width, height int, scale float64) {
+	if scale <= 1.0 {
+		return
+	}
+	logicalW, logicalH := wp.Size()
+	if logicalW <= 0 || logicalH <= 0 {
+		return
+	}
+	threshold := 1.5
+	if width > int(float64(logicalW)*threshold) || height > int(float64(logicalH)*threshold) {
+		gg.Logger().Warn("ggcanvas.New: dimensions look like physical pixels, not logical — "+
+			"pass ctx.Width()/ctx.Height() instead of FramebufferWidth/FramebufferHeight",
+			"passed", fmt.Sprintf("%dx%d", width, height),
+			"logical_window", fmt.Sprintf("%dx%d", logicalW, logicalH),
+			"scale", scale)
+	}
 }
 
 // NewWithScale creates a Canvas with HiDPI device scale support.
@@ -290,9 +312,10 @@ func (c *Canvas) NeedsAnimationFrame() bool {
 }
 
 // SetPresentDamage sets damage rectangles for the next present call (ADR-021 Level 4).
-// Rects are in physical pixels with top-left origin. They are forwarded to
-// gogpu SetDamageRects() → wgpu PresentWithDamage() → OS compositor hint
-// (VK_KHR_incremental_present, DX12 Present1, eglSwapBuffersWithDamage).
+// Rects are in logical (user-space) coordinates with top-left origin. They are
+// automatically scaled to physical pixels and forwarded to gogpu SetDamageRects()
+// → wgpu PresentWithDamage() → OS compositor hint (VK_KHR_incremental_present,
+// DX12 Present1, eglSwapBuffersWithDamage).
 //
 // Callers with retained-mode knowledge (e.g. ui widget tree) should provide
 // BOTH old and new bounds of moved/resized objects. Immediate-mode callers
@@ -302,6 +325,19 @@ func (c *Canvas) NeedsAnimationFrame() bool {
 // Rects are consumed after one present and do not persist across frames.
 // When nil or empty, the full surface is presented (backward compatible).
 func (c *Canvas) SetPresentDamage(rects []image.Rectangle) {
+	scale := c.ctx.DeviceScale()
+	if scale != 1.0 {
+		scaled := make([]image.Rectangle, len(rects))
+		for i, r := range rects {
+			scaled[i] = image.Rect(
+				int(math.Floor(float64(r.Min.X)*scale)),
+				int(math.Floor(float64(r.Min.Y)*scale)),
+				int(math.Ceil(float64(r.Max.X)*scale)),
+				int(math.Ceil(float64(r.Max.Y)*scale)),
+			)
+		}
+		rects = scaled
+	}
 	c.presentDamageRects = rects
 }
 
@@ -352,12 +388,21 @@ func (c *Canvas) MarkDirtyRegion(r image.Rectangle) {
 // This ensures the first render pass clears the surface while mid-frame
 // CPU fallback flushes (bitmap text, gradient fill) use LoadOpLoad to
 // preserve previously drawn content. See RENDER-DIRECT-003.
+//
+// Per-frame state (matrix, path, clip, mask) is automatically reset via
+// Push/Pop wrapper (Skia SkAutoCanvasRestore pattern, ADR-032). Configuration
+// state (font, paint color, textMode) persists across frames.
 func (c *Canvas) Draw(fn func(*gg.Context)) error {
 	if c.closed {
 		return ErrCanvasClosed
 	}
 	gg.BeginAcceleratorFrame()
+	c.ctx.Push()
+	c.ctx.Identity()
+	c.ctx.ClearPath()
+	c.ctx.ResetFrameDamage()
 	fn(c.ctx)
+	c.ctx.Pop()
 	c.MarkDirty()
 	return nil
 }

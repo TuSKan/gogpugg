@@ -29,6 +29,22 @@ type SoftwareRenderer struct {
 	// to support forced algorithm selection (RasterizerSparseStrips, etc.).
 	// Reset to RasterizerAuto after each call.
 	rasterizerMode RasterizerMode
+
+	// antiAlias is set by Context before calling Fill/Stroke.
+	// When false, the NoAAFiller (integer scanline, binary coverage) is used
+	// instead of AnalyticFiller/CoverageFiller. Reset to true after each call.
+	antiAlias bool
+
+	// noAAFiller is the non-anti-aliased filler (lazy-initialized).
+	noAAFiller *raster.NoAAFiller
+
+	// noAAEdgeBuilder is a separate EdgeBuilder with aaShift=0 for non-AA.
+	// Non-AA does not need sub-pixel edge coordinate shifting.
+	noAAEdgeBuilder *raster.EdgeBuilder
+
+	// scratchStrokePath reuses path allocation across Stroke calls.
+	// Matches Skia fOuter.reset() pattern — zero per-stroke allocation.
+	scratchStrokePath *Path
 }
 
 // NewSoftwareRenderer creates a new software renderer with analytic anti-aliasing.
@@ -40,6 +56,7 @@ func NewSoftwareRenderer(width, height int) *SoftwareRenderer {
 		width:          width,
 		height:         height,
 		deviceScale:    1.0,
+		antiAlias:      true,
 	}
 }
 
@@ -54,6 +71,19 @@ func (r *SoftwareRenderer) Resize(width, height int) {
 	}
 	r.edgeBuilder = eb
 	r.analyticFiller = raster.NewAnalyticFiller(width, height)
+	// Reset lazy no-AA resources so they pick up new dimensions.
+	r.noAAFiller = nil
+	r.noAAEdgeBuilder = nil
+}
+
+// SetAntiAlias enables or disables anti-aliasing for subsequent Fill/Stroke calls.
+// When disabled, the NoAAFiller (integer scanline, binary coverage) is used
+// instead of the AnalyticFiller or CoverageFiller.
+//
+// This method is intended for use by the scene renderer which needs to
+// propagate per-draw AA state decoded from TagSetAntiAlias commands.
+func (r *SoftwareRenderer) SetAntiAlias(enabled bool) {
+	r.antiAlias = enabled
 }
 
 // SetDeviceScale sets the HiDPI device scale factor for the renderer.
@@ -313,6 +343,12 @@ func applyMaskCoverage(maskFn func(x, y int) uint8, px, py int, coverage uint8) 
 // When rasterizerMode is set (via Context.SetRasterizerMode), the forced
 // algorithm is used instead of auto-selection.
 func (r *SoftwareRenderer) Fill(pixmap *Pixmap, p *Path, paint *Paint) error {
+	// Non-AA path: completely separate code path (Skia/tiny-skia pattern).
+	// Integer scanline, binary coverage, no CoverageFiller/AnalyticFiller.
+	if !r.antiAlias {
+		return r.fillNoAA(pixmap, p, paint)
+	}
+
 	// Force mode: specific algorithm without auto-selection.
 	switch r.rasterizerMode {
 	case RasterizerAnalytic:
@@ -404,6 +440,121 @@ func (r *SoftwareRenderer) Fill(pixmap *Pixmap, p *Path, paint *Paint) error {
 	return nil
 }
 
+// fillNoAA renders a filled path without anti-aliasing.
+// Uses a dedicated NoAAFiller that produces solid horizontal spans with
+// binary coverage (0 or 255). This is a completely separate code path
+// from the AA rasterizer (Skia SkScan::FillPath / tiny-skia scan::path pattern).
+func (r *SoftwareRenderer) fillNoAA(pixmap *Pixmap, p *Path, paint *Paint) error {
+	// Lazy-init the no-AA edge builder and filler.
+	if r.noAAEdgeBuilder == nil {
+		r.noAAEdgeBuilder = raster.NewEdgeBuilder(0) // aaShift=0: no sub-pixel
+		if r.deviceScale > 1.0 {
+			r.noAAEdgeBuilder.SetFlattenTolerance(0.1 / r.deviceScale)
+		}
+	}
+	if r.noAAFiller == nil {
+		r.noAAFiller = raster.NewNoAAFiller(r.width, r.height)
+	}
+
+	r.noAAEdgeBuilder.Reset()
+
+	clipMargin := float32(2)
+	clipRect := raster.Rect{
+		MinX: -clipMargin,
+		MinY: -clipMargin,
+		MaxX: float32(pixmap.Width()) + clipMargin,
+		MaxY: float32(pixmap.Height()) + clipMargin,
+	}
+	r.noAAEdgeBuilder.SetClipRect(&clipRect)
+
+	r.noAAEdgeBuilder.SetFlattenCurves(true)
+	defer r.noAAEdgeBuilder.SetFlattenCurves(false)
+
+	verbs := p.Verbs()
+	if len(verbs) > 0 {
+		verbBytes := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(verbs))), len(verbs))
+		r.noAAEdgeBuilder.BuildFromPathF64(verbBytes, p.Coords())
+	}
+
+	if r.noAAEdgeBuilder.IsEmpty() {
+		return nil
+	}
+
+	coreFillRule := raster.FillRuleNonZero
+	if paint.FillRule == FillRuleEvenOdd {
+		coreFillRule = raster.FillRuleEvenOdd
+	}
+
+	clipFn := paint.ClipCoverage
+	maskFn := paint.MaskCoverage
+
+	if color, ok := solidColorFromPaint(paint); ok {
+		r.noAAFiller.Fill(r.noAAEdgeBuilder, coreFillRule, func(y, left, spanWidth int) {
+			r.blitNoAASolidSpan(pixmap, y, left, spanWidth, color, clipFn, maskFn)
+		})
+	} else {
+		r.noAAFiller.Fill(r.noAAEdgeBuilder, coreFillRule, func(y, left, spanWidth int) {
+			r.blitNoAAPaintSpan(pixmap, y, left, spanWidth, paint, clipFn, maskFn)
+		})
+	}
+
+	return nil
+}
+
+// blitNoAASolidSpan blits a solid-color span with optional clip and mask.
+func (r *SoftwareRenderer) blitNoAASolidSpan(
+	pixmap *Pixmap, y, left, spanWidth int, color RGBA,
+	clipFn func(float64, float64) byte, maskFn func(int, int) uint8,
+) {
+	for x := left; x < left+spanWidth; x++ {
+		cov := noaaPixelCoverage(x, y, clipFn, maskFn)
+		if cov == 0 {
+			continue
+		}
+		r.blendCoverageSolid(pixmap, x, y, cov, color)
+	}
+}
+
+// blitNoAAPaintSpan blits a paint-sampled span with optional clip and mask.
+func (r *SoftwareRenderer) blitNoAAPaintSpan(
+	pixmap *Pixmap, y, left, spanWidth int, paint *Paint,
+	clipFn func(float64, float64) byte, maskFn func(int, int) uint8,
+) {
+	for x := left; x < left+spanWidth; x++ {
+		cov := noaaPixelCoverage(x, y, clipFn, maskFn)
+		if cov == 0 {
+			continue
+		}
+		c := paint.ColorAt(float64(x)+0.5, float64(y)+0.5)
+		r.blendCoverageSolid(pixmap, x, y, cov, c)
+	}
+}
+
+// noaaPixelCoverage computes per-pixel coverage from clip and mask functions.
+// Returns 0 if the pixel is fully clipped/masked, 255 if no clip/mask is active.
+func noaaPixelCoverage(x, y int, clipFn func(float64, float64) byte, maskFn func(int, int) uint8) byte {
+	cov := byte(255)
+	if clipFn != nil {
+		clipCov := clipFn(float64(x)+0.5, float64(y)+0.5)
+		if clipCov == 0 {
+			return 0
+		}
+		cov = clipCov
+	}
+	if maskFn != nil {
+		mc := maskFn(x, y)
+		if mc == 0 {
+			return 0
+		}
+		if cov != 255 {
+			cov = uint8(uint16(cov) * uint16(mc) / 255)
+		} else {
+			cov = mc
+		}
+	}
+	return cov
+}
+
 // blendCoverageSolid blends a single pixel with solid color and coverage.
 // Uses premultiplied source-over compositing.
 func (r *SoftwareRenderer) blendCoverageSolid(pixmap *Pixmap, x, y int, coverage uint8, color RGBA) {
@@ -489,6 +640,10 @@ func (r *SoftwareRenderer) forcedFiller(mode RasterizerMode) CoverageFiller {
 // solidColorFromPaint returns the solid color if paint is solid.
 // Returns (color, true) for solid paints, (zero, false) for patterns/gradients.
 func solidColorFromPaint(paint *Paint) (RGBA, bool) {
+	// Fast path: inline solid color (zero allocation, no interface dispatch).
+	if paint.isSolid {
+		return paint.solidColor, true
+	}
 	// Check Brush first (takes precedence)
 	if paint.Brush != nil {
 		if sb, ok := paint.Brush.(SolidBrush); ok {
@@ -685,11 +840,24 @@ func (r *SoftwareRenderer) Stroke(pixmap *Pixmap, p *Path, paint *Paint) error {
 	// Expand stroke to fill path (SOA: verb+coords in, verb+coords out)
 	outVerbs, outCoords := expander.Expand(strokeVerbs, pathToDraw.Coords())
 
-	// Convert back to gg.Path
-	strokePath := strokeResultToPath(outVerbs, outCoords)
+	// Convert back to gg.Path (reuse scratch to avoid per-stroke allocation).
+	if r.scratchStrokePath == nil {
+		r.scratchStrokePath = NewPath()
+	}
+	strokeResultToPath(r.scratchStrokePath, outVerbs, outCoords)
 
-	// Fill the stroke path - this gives us anti-aliased strokes
-	return r.Fill(pixmap, strokePath, paint)
+	// Route stroke fills through AnalyticFiller (Skia AAA scanline).
+	// Stroke-expanded multi-contour outlines (e.g., closed path → 4 contours)
+	// require per-scanline winding tracking that the tile-based SparseStripsFiller
+	// does not support (Vello's strip pipeline uses per-strip fill_gap flags).
+	// This matches Skia Ganesh which routes strokes through scanline renderers,
+	// not tile rasterizers. Single-contour strokes work with either filler after
+	// the expander.go fix (#347), but multi-contour needs scanline.
+	prevMode := r.rasterizerMode
+	r.rasterizerMode = RasterizerAnalytic
+	err := r.Fill(pixmap, r.scratchStrokePath, paint)
+	r.rasterizerMode = prevMode
+	return err
 }
 
 // convertVerbsToStroke converts gg.PathVerb slice to stroke.PathVerb slice.
@@ -702,29 +870,29 @@ func convertVerbsToStroke(verbs []PathVerb) []stroke.PathVerb {
 	return result
 }
 
-// strokeResultToPath converts stroke output (verbs+coords) back to gg.Path.
-func strokeResultToPath(verbs []stroke.PathVerb, coords []float64) *Path {
-	p := NewPath()
+// strokeResultToPath converts stroke output (verbs+coords) into dst Path.
+// Reuses dst to avoid per-stroke allocation (Skia fOuter.reset() pattern).
+func strokeResultToPath(dst *Path, verbs []stroke.PathVerb, coords []float64) {
+	dst.Reset()
 	ci := 0
 	for _, v := range verbs {
 		switch v {
 		case stroke.VerbMoveTo:
-			p.MoveTo(coords[ci], coords[ci+1])
+			dst.MoveTo(coords[ci], coords[ci+1])
 			ci += 2
 		case stroke.VerbLineTo:
-			p.LineTo(coords[ci], coords[ci+1])
+			dst.LineTo(coords[ci], coords[ci+1])
 			ci += 2
 		case stroke.VerbQuadTo:
-			p.QuadraticTo(coords[ci], coords[ci+1], coords[ci+2], coords[ci+3])
+			dst.QuadraticTo(coords[ci], coords[ci+1], coords[ci+2], coords[ci+3])
 			ci += 4
 		case stroke.VerbCubicTo:
-			p.CubicTo(coords[ci], coords[ci+1], coords[ci+2], coords[ci+3], coords[ci+4], coords[ci+5])
+			dst.CubicTo(coords[ci], coords[ci+1], coords[ci+2], coords[ci+3], coords[ci+4], coords[ci+5])
 			ci += 6
 		case stroke.VerbClose:
-			p.Close()
+			dst.Close()
 		}
 	}
-	return p
 }
 
 // convertLineCap converts gg.LineCap to stroke.LineCap.
@@ -948,11 +1116,17 @@ func pathEndAt(p *Path, x, y float64) bool {
 // flattenQuadForDash flattens a quadratic bezier to line points.
 func flattenQuadForDash(x0, y0, cx, cy, x1, y1, tolerance float64) []float64 {
 	points := []float64{x0, y0}
-	flattenQuadRecForDash(x0, y0, cx, cy, x1, y1, tolerance, &points)
+	flattenQuadRecForDash(x0, y0, cx, cy, x1, y1, tolerance, &points, 0)
 	return points
 }
 
-func flattenQuadRecForDash(x0, y0, cx, cy, x1, y1, tolerance float64, points *[]float64) {
+func flattenQuadRecForDash(x0, y0, cx, cy, x1, y1, tolerance float64, points *[]float64, depth int) {
+	// Max recursion depth to prevent stack overflow (e.g. NaN coordinates)
+	if depth > 10 {
+		*points = append(*points, x1, y1)
+		return
+	}
+
 	// Check if curve is flat enough (distance from control to midpoint of line)
 	mx := (x0 + x1) / 2
 	my := (y0 + y1) / 2
@@ -973,18 +1147,24 @@ func flattenQuadRecForDash(x0, y0, cx, cy, x1, y1, tolerance float64, points *[]
 	x012 := (x01 + x12) / 2
 	y012 := (y01 + y12) / 2
 
-	flattenQuadRecForDash(x0, y0, x01, y01, x012, y012, tolerance, points)
-	flattenQuadRecForDash(x012, y012, x12, y12, x1, y1, tolerance, points)
+	flattenQuadRecForDash(x0, y0, x01, y01, x012, y012, tolerance, points, depth+1)
+	flattenQuadRecForDash(x012, y012, x12, y12, x1, y1, tolerance, points, depth+1)
 }
 
 // flattenCubicForDash flattens a cubic bezier to line points.
 func flattenCubicForDash(x0, y0, c1x, c1y, c2x, c2y, x1, y1, tolerance float64) []float64 {
 	points := []float64{x0, y0}
-	flattenCubicRecForDash(x0, y0, c1x, c1y, c2x, c2y, x1, y1, tolerance, &points)
+	flattenCubicRecForDash(x0, y0, c1x, c1y, c2x, c2y, x1, y1, tolerance, &points, 0)
 	return points
 }
 
-func flattenCubicRecForDash(x0, y0, c1x, c1y, c2x, c2y, x1, y1, tolerance float64, points *[]float64) {
+func flattenCubicRecForDash(x0, y0, c1x, c1y, c2x, c2y, x1, y1, tolerance float64, points *[]float64, depth int) {
+	// Max recursion depth to prevent stack overflow (e.g. NaN coordinates)
+	if depth > 10 {
+		*points = append(*points, x1, y1)
+		return
+	}
+
 	// Check if curve is flat enough
 	// Use distance of control points from the line
 	d1 := pointLineDistance(c1x, c1y, x0, y0, x1, y1)
@@ -1010,8 +1190,8 @@ func flattenCubicRecForDash(x0, y0, c1x, c1y, c2x, c2y, x1, y1, tolerance float6
 	x0123 := (x012 + x123) / 2
 	y0123 := (y012 + y123) / 2
 
-	flattenCubicRecForDash(x0, y0, x01, y01, x012, y012, x0123, y0123, tolerance, points)
-	flattenCubicRecForDash(x0123, y0123, x123, y123, x23, y23, x1, y1, tolerance, points)
+	flattenCubicRecForDash(x0, y0, x01, y01, x012, y012, x0123, y0123, tolerance, points, depth+1)
+	flattenCubicRecForDash(x0123, y0123, x123, y123, x23, y23, x1, y1, tolerance, points, depth+1)
 }
 
 // pointLineDistance calculates perpendicular distance from point to line.
