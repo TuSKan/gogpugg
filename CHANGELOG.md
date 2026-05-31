@@ -5,6 +5,89 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.7] - 2026-05-26
+
+### Changed
+
+- **Dependencies:** wgpu v0.28.7 → v0.29.1, gogpu v0.39.1 → v0.40.0 in examples.
+
+## [0.48.6] - 2026-05-26
+
+### Fixed
+
+- **SparseStripsFiller winding propagation** (BUG-SPARSE-STRIPS-001) — interior tiles
+  between shape edges rendered as empty gaps. Fixed backdrop calculation to use Vello
+  `backdrop.wgsl` prefix-sum pattern, added `windingDelta` propagation between non-adjacent
+  tiles (Rust Vello `strip.rs:259-263`), and backdrop-only tile emission for filled interiors.
+
+- **SDF thin stroke invisible on GPU** (#346, ADR-040) — SDF stroke with `lineWidth < 2.0`
+  now falls back to geometric expansion. The SDF annular ring at sub-2px widths is thinner
+  than the smoothstep AA zone, producing near-zero coverage. Affects both CPU SDF accelerator
+  and GPU render context. M3 Outlined button (lineWidth=1.5) now renders correctly.
+
+- **Present damage union** (TASK-GG-PRESENT-DAMAGE-UNION) — `forwardDamageRects` now unions
+  explicit rects from `SetPresentDamage()` with immediate-mode `FrameDamage`, never letting
+  caller understate actual damage. Previously explicit rects overrode frame damage, causing
+  DWM flickering when debug overlay drew outside declared damage region.
+
+## [0.48.5] - 2026-05-25
+
+### Fixed
+
+- **Fractional glyph advances: letters merging at 10-12px** (ADR-039) — `GlyphAdvance()`
+  now uses `font.HintingNone` for layout advances (design metrics, fractional) instead of
+  `font.HintingFull` (grid-fitted, integer-rounded). At 12px Arial, "T" advance changes
+  from 7.0 to 7.33, preserving the 0.97px gap between "T" and "e" that was lost to rounding.
+  Matches Skia `linearHoriAdvance` / Cairo `hint_metrics=OFF` enterprise pattern.
+
+- **TextModeAliased CPU fallback** (#353) — `dc.SetTextMode(gg.TextModeAliased)` now works
+  on CPU-only contexts (`gg.NewContext()` + `SavePNG()`). Uses per-glyph `NoAAFiller`
+  rasterization (binary 0/255 coverage), matching Skia `SkFont::Edging::kAlias` and
+  GPU Tier 6 path. Previously fell back to `x/image/font.Drawer` which always anti-aliases.
+
+- **SDF thin stroke invisible on GPU** (#346, ADR-040) — SDF stroke with `lineWidth < 2.0`
+  now falls back to geometric expansion. The SDF annular ring at sub-2px widths is thinner
+  than the smoothstep AA zone, producing near-zero coverage. Affects both CPU SDF accelerator
+  and GPU render context. M3 Outlined button (lineWidth=1.5) now renders correctly.
+
+### Changed
+
+- **Per-glyph text rendering** — `text.Draw()` replaced `font.Drawer` with per-glyph
+  rendering via `GlyphMaskRasterizer.RasterizeHinted()`. Enables independent control of
+  outline hinting (crisp stems) and advance positioning (fractional). Shared `drawGlyphs()`
+  helper used by both `Draw()` and `DrawAliased()`.
+
+### Added
+
+- `text.DrawAliased()` — CPU aliased text rendering function, parallel to `text.Draw()`.
+- 13 new tests: `TestDrawAliased_BinaryAlpha`, `TestDrawAliased_MultipleSizes`,
+  `TestTextModeAliased_BinaryAlpha`, `TestTextModeAliased_DrawString_CPUFallback`,
+  and 9 more covering edge cases and GPU/CPU consistency.
+
+## [0.48.4] - 2026-05-25
+
+### Fixed
+
+- **Stroke inner join: teeth on circles, twisted corners on rectangles** (#354, #353) —
+  `handleInnerJoin` now emits two `lineTo` calls matching tiny-skia `stroker.rs:1370-1379`:
+  first routes through pivot to prevent self-intersection, then places the inner path at
+  the correct normal offset for the next segment (ADR-038). Previously the second `lineTo`
+  was missing, causing the inner path to "jump" diagonally from pivot to the next segment,
+  creating visible sawtooth artifacts on thick strokes (lineWidth ≥ 5). Affects all curved
+  shapes: circles, ellipses, rounded rectangles, arcs, regular polygons, glyph outlines.
+
+### Changed
+
+- **StrokeString godoc** — added recommendation to use `SetLineJoin(LineJoinRound)` for
+  thick text strokes. Default `LineJoinMiter` produces miter spikes at glyph segment
+  junctions, matching enterprise text renderer behavior (Skia, Cairo, Qt).
+
+### Added
+
+- Tests: `TestStrokeExpander_ThickCircleNoTeeth` (4 lineWidth values), 
+  `TestStrokeExpander_ThickRectNoRotation` (4 lineWidth values),
+  `TestStrokeExpander_InnerJoinOffset` — regression tests for #354.
+
 ## [0.48.3] - 2026-05-22
 
 ### Fixed
