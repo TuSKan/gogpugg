@@ -746,7 +746,10 @@ func (c *Context) drawStringAsOutlines(s string, x, y float64) {
 		return
 	}
 
-	devicePath := path.Transform(c.totalMatrix())
+	// User matrix only; doFill() applies deviceMatrix via currentDevicePath().
+	// Using totalMatrix double-applies the device scale (translate ends up
+	// scaled by scale²), flinging rotated text off-canvas on HiDPI.
+	devicePath := path.Transform(c.matrix)
 
 	// Route through the normal fill pipeline (doFill) so GPU accelerator
 	// can render to the surface when SurfaceTarget is active. Without this,
